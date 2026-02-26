@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./cs336-basics"
+    ],
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python"
+}
