@@ -46,18 +46,23 @@ class ToyModel(nn.Module):
     
 if __name__ == '__main__':
     model = ToyModel(10,10).cuda()
-    # dtype: torch.dtype = torch.float16
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float16
+    # dtype: torch.dtype = torch.bfloat16
     x: torch.Tensor = torch.rand(10, device="cuda")
     targets: torch.Tensor = torch.rand(10, device="cuda")
-    print(f"the input's dtype: {x.dtype}")
+    
+    optimizer = torch.optim.AdamW(model.parameter(), lr=0.001)
+    scaler = torch.amp.GradScaler("cuda")  # 只在 float16 需要
     criterion = nn.MSELoss()
         
     with torch.autocast(device_type="cuda",dtype=dtype):
         y = model(x)
-        print(y.dtype)
         loss = criterion(y, targets)
-        print(loss.dtype)
+        
+    # backward
+    optimizer.zero_grad()           # 清零上一步的梯度
+    scaler.scale(loss).backward()   # loss * scale → backward
+    scaler.step(optimizer)          # unscale → check inf/nan → optimizer.step
+    scaler.update()                 # 动态调整 scale factor
     
-    loss.backward() 
     print(f"fc1 weight gradient dtype: {model.fc1.weight.grad.dtype}")
