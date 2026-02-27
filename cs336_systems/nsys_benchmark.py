@@ -83,12 +83,13 @@ print(f"使用设备: {device}")
 warmup = True
 time_forward = True
 time_backward = True
+mixed_precision = True
 
 batch_size = 4
 vocab_size = 10000
 context_length = 256
 seq_len = 100
-
+dtype: torch.dtype = torch.bfloat16
 warmup_iter = 5
 benchmark_iter = 10
 
@@ -139,24 +140,43 @@ def run_benchmark(config):
     # --- 正式测试阶段 ---
     # 使用 "benchmark_iteration" 包裹你真正想要分析的步骤
     with nvtx.range("benchmark_iteration"):
-        for i in range(benchmark_iter):
-            # 也可以针对 Forward/Backward/Optimizer 分别标记
-            with nvtx.range(f"step_{i}"):
-                with nvtx.range("forward"):
-                    logits = model(data)
+        if not mixed_precision: 
+            for i in range(benchmark_iter):
+                # 也可以针对 Forward/Backward/Optimizer 分别标记
+                with nvtx.range(f"step_{i}"):
+                    with nvtx.range("forward"):
+                        logits = model(data)
+                    
+                    with nvtx.range("backward"):
+                        loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+                        loss.backward()
+                    
+                    with nvtx.range("optimizer"):
+                        optimizer.step()
+                        optimizer.zero_grad()
                 
-                with nvtx.range("backward"):
-                    loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
-                    loss.backward()
+                torch.cuda.synchronize()
+        else:
+            for i in range(benchmark_iter):
+                # 也可以针对 Forward/Backward/Optimizer 分别标记
+                with nvtx.range(f"step_{i}"):
+                    with torch.autocast(device_type="cuda",dtype=dtype):
+                        with nvtx.range("forward"):
+                            logits = model(data)
+                            loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+                    
+                        with nvtx.range("backward"):
+                            loss.backward()
+                        
+                        with nvtx.range("optimizer"):
+                            optimizer.step()
+                            optimizer.zero_grad()
                 
-                with nvtx.range("optimizer"):
-                    optimizer.step()
-                    optimizer.zero_grad()
+                torch.cuda.synchronize()
             
-            torch.cuda.synchronize()
 
 if __name__ == '__main__':
-    run_benchmark(model_configs['small'])
+    run_benchmark(model_configs['medium'])
 
 
 
