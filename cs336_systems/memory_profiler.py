@@ -70,10 +70,10 @@ seq_len = 100
 
 # hyperparameters for benchmarking 
 warmup_iter = 5
-benchmark_iter = 10
+benchmark_iter = 5
 
     
-def benchmark_llm(config):
+def benchmark_llm_full(config):
     # init model, loss and optimizer
     model = BasicsTransformerLM(
         vocab_size=config['vocab_size'],
@@ -110,29 +110,97 @@ def benchmark_llm(config):
         if device.type == 'cuda':
             torch.cuda.synchronize()
             
-    # benchmark
-    for _ in range(benchmark_iter):
-        # zero up gradiant
-        optimizer.zero_grad()
+    # Memory profiling region
+    torch.cuda.memory._record_memory_history(max_entries=100000, stacks='all')        
+    try:
+         
+        # benchmark
+        for _ in range(benchmark_iter):
+            # zero up gradiant
+            optimizer.zero_grad()
+            
+            # forward pass
+            logits = model(data)
+            loss = criterion(logits, targets)
+            
+            # debug: print the size of logits and targets
+            # print(f"size of logits: {logits.size()}")
+            # print(f"size of targets: {targets.size()}")
+            
+            # backward pass
+            loss.backward()
+            
+            # update optimizer
+            optimizer.step()
+            
+            # sync to ensure everything finishes
+            torch.cuda.synchronize()
         
-        # forward pass
+        torch.cuda.memory._dump_snapshot("llm_benchmarking_complete.pickle")
+        print("file dumped")
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+        
+        
+        
+def benchmark_llm_forward_only(config):
+    # init model, loss and optimizer
+    model = BasicsTransformerLM(
+        vocab_size=config['vocab_size'],
+        context_length=config['context_length'],
+        d_model=config['d_model'],
+        num_layers=config['num_layers'],
+        num_heads=config['num_heads'],
+        d_ff=config['d_ff'],
+        rope_theta=10000.0
+    ).to(device)
+    
+    criterion = cross_entropy
+    
+    optimizer = AdamW(
+        params=model.parameters(),
+        lr=1e-3,              
+        betas=(0.9, 0.999),   
+        eps=1e-8,             
+        weight_decay=0.01,    
+    )
+    
+    # init data 
+    data = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    
+    # warmup
+    for _ in range(warmup_iter):
         logits = model(data)
-        loss = criterion(logits, targets)
-        
-        # debug: print the size of logits and targets
-        # print(f"size of logits: {logits.size()}")
-        # print(f"size of targets: {targets.size()}")
-        
-        # backward pass
+        if device.type == 'cuda':
+            torch.cuda.synchronize() 
+        # Note: warmup也需要backward pass
+        loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
         loss.backward()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+            
+    # Memory profiling region
+    torch.cuda.memory._record_memory_history(max_entries=100000, stacks='all')        
+    try:
+         
+        # benchmark
+        for _ in range(benchmark_iter):            
+            # forward pass
+            logits = model(data)
+            
+            # sync to ensure everything finishes
+            torch.cuda.synchronize()
         
-        # update optimizer
-        optimizer.step()
-        
-        # sync to ensure everything finishes
-        torch.cuda.synchronize()
+        torch.cuda.memory._dump_snapshot("llm_benchmarking_forward_only.pickle")
+        print("file dumped")
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
     
     
 if __name__ == '__main__':
     # demo()
-    benchmark_llm(model_configs['medium'])
+    # benchmark_llm(model_configs['medium'])
+    # benchmark_llm_forward_only(model_configs['medium'])
+    benchmark_llm_full(model_configs['medium'])
