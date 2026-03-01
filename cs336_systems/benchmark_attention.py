@@ -194,6 +194,13 @@ class CausalNoHeadSelfAttention(nn.Module):
         Q = self.q_proj(x)
         K = self.k_proj(x)
         V = self.v_proj(x)
+        
+        # debug: print the shape of Q K V
+        # ([8, 256, 64])
+        # batch size, sequence length, dimension
+        # print(f"the shape of Q: {Q.shape}")
+        # print(f"the shape of K: {K.shape}")
+        # print(f"the shape of v: {V.shape}")
 
         # Skip spliting into many heads
         # Q, K, V all have shape (batch_size, seq, d)
@@ -205,6 +212,11 @@ class CausalNoHeadSelfAttention(nn.Module):
 
         if token_positions is None:
             token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+            
+        # debug: print token positions
+        # print(f"the length of b: {len(b)}")  # 1
+        # print(f"the value of b: {b}")        # 8
+        # print(f"token_positions: {token_positions}")  # from 0 to sequence length
 
         # Duplicate token positions for each head
         # token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
@@ -214,9 +226,17 @@ class CausalNoHeadSelfAttention(nn.Module):
 
         # Construct causal mask
         seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+        # qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+        # kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+        # fix the number of head dimension
+        qi = einx.rearrange('query -> b... query 1', seq, b=[1] * len(b))
+        kj = einx.rearrange('key   -> b... 1     key', seq, b=[1] * len(b))
         causal_mask = qi >= kj  # (query, key)
+        
+        # debug: print the mask 
+        # print(f"qi: \n{qi}")
+        # print(f"kj: \n{kj}")
+        # print(f"causal mask: \n{causal_mask}")
 
         # Shape: (..., num_heads, sequence_length, d_k)
         attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
@@ -233,15 +253,25 @@ class CausalNoHeadSelfAttention(nn.Module):
 
 
 if __name__ == '__main__':
+    # hyperparameters
     batch_size = 8
-    sequence_length = 256
-    d_model = 64
-    x = torch.randn(batch_size, sequence_length, d_model)
+    sequence_lengths = [256,1024,4096,8192,16384]
+    d_models = [16,32,64,128]
     
-    rope = RotaryEmbedding(context_length=1024, dim=d_model)
-    attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope)
+    # iterate thru all combinations
+    for sequence_length in sequence_lengths:
+        for d_model in d_models:
+            print(f"\nCurrent sequence length: {sequence_length}, d_model: {d_model}")
     
-    # forward
-    y = attention(x)
-    print(y)
-    print("forward finished")
+            # input
+            x = torch.randn(batch_size, sequence_length, d_model)
+            
+            # model
+            rope = RotaryEmbedding(context_length=sequence_length, dim=d_model)
+            attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope)
+            
+            # forward pass
+            y = attention(x)
+            
+            # debug: print the shape of the attention output
+            print(y.shape)
