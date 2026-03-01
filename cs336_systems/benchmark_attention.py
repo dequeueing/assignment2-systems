@@ -1,3 +1,6 @@
+import statistics
+import timeit
+
 from cs336_basics.model import RotaryEmbedding, Linear
 from cs336_basics.nn_utils import softmax
 
@@ -257,21 +260,78 @@ if __name__ == '__main__':
     batch_size = 8
     sequence_lengths = [256,1024,4096,8192,16384]
     d_models = [16,32,64,128]
+    device = "cuda"
     
     # iterate thru all combinations
     for sequence_length in sequence_lengths:
         for d_model in d_models:
             print(f"\nCurrent sequence length: {sequence_length}, d_model: {d_model}")
-    
-            # input
-            x = torch.randn(batch_size, sequence_length, d_model)
             
-            # model
-            rope = RotaryEmbedding(context_length=sequence_length, dim=d_model)
-            attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope)
-            
-            # forward pass
-            y = attention(x)
-            
-            # debug: print the shape of the attention output
-            print(y.shape)
+            try:
+                # input
+                x = torch.randn(batch_size, sequence_length, d_model).to(device)
+                
+                # model
+                rope = RotaryEmbedding(context_length=sequence_length, dim=d_model).to(device)
+                attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope).to(device)
+                
+                # Use no_grad for inference to save memory
+                with torch.no_grad():
+                    # warmup runs
+                    for _ in range(5):
+                        _ = attention(x)
+                        torch.cuda.synchronize()
+                    
+                    # Print memory usage after warmup (shows actual peak usage)
+                    # Note: this does not work, since it is only a timestamp.
+                    # But the memory reaches its peak during attention forwarding
+                    # if device == "cuda":
+                    #     allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                    #     reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+                    #     max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+                    #     print(f"GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB, Peak: {max_allocated:.2f} GB")
+                    
+                    # timing pass
+                    time_list = []
+                    for _ in range(100):
+                        # start timer
+                        start = timeit.default_timer()
+                        
+                        # forward pass
+                        _ = attention(x)
+                        torch.cuda.synchronize()
+                        
+                        # stop timer
+                        end = timeit.default_timer()
+                        
+                        # record time 
+                        time_list.append(end - start)
+                        
+                # get the statistics of time used: max, min, mean, std
+                mean_val = statistics.mean(time_list)
+                variance_val = statistics.stdev(time_list)
+                max_val = max(time_list)
+                min_val = min(time_list)
+                print(f"最大值: {max_val:.6f} 秒, 最小值: {min_val:.6f} 秒, 平均值: {mean_val:.6f} 秒, 标准差: {variance_val:.6f}")
+                
+            except torch.cuda.OutOfMemoryError:
+                print(f"⚠️  CUDA OOM: Skipping (seq_len={sequence_length}, d_model={d_model})")
+                # Clear cache to recover from OOM
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"❌ Error: {type(e).__name__}: {e}")
+                continue
+            finally:
+                # the memory will be automatically released,
+                # but we explicit clean up after each iteration
+                if 'x' in locals():
+                    del x
+                if 'rope' in locals():
+                    del rope
+                if 'attention' in locals():
+                    del attention
+                    
+                # Note: locals() returns a dictionary of all local variables in the current scope
+                # This is to ensure that the varialbes we delete are actually in the scope
+                torch.cuda.empty_cache()
