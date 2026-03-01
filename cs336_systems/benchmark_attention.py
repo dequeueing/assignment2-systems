@@ -276,7 +276,10 @@ if __name__ == '__main__':
                 attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope).to(device)
                 
                 # Use no_grad for inference to save memory
-                with torch.no_grad():
+                # backward pass, we need gradient info
+                from contextlib import nullcontext
+                # with torch.no_grad():
+                with nullcontext():
                     # warmup runs
                     for _ in range(5):
                         _ = attention(x)
@@ -292,27 +295,55 @@ if __name__ == '__main__':
                     #     print(f"GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB, Peak: {max_allocated:.2f} GB")
                     
                     # timing pass
-                    time_list = []
-                    for _ in range(100):
+                    forward_time = []
+                    backward_time = []
+                    for i in range(100):
                         # start timer
                         start = timeit.default_timer()
                         
                         # forward pass
-                        _ = attention(x)
+                        logits = attention(x)
                         torch.cuda.synchronize()
                         
                         # stop timer
                         end = timeit.default_timer()
                         
                         # record time 
-                        time_list.append(end - start)
+                        forward_time.append(end - start)
+                        
+                        # count the memory 
+                        if i == 50: 
+                            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                            reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+                            max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+                            print(f"GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB, Peak: {max_allocated:.2f} GB")
+                            
+                            # Note: memory_reserved() return the current GPU memory **managed by the caching allocator**
+                            # So the available GPU memory should be full capacity - allocated
+                        
+                        # calculate loss
+                        loss = torch.max(logits)
+                        
+                        # backward 
+                        start = timeit.default_timer()
+                        loss.backward()
+                        torch.cuda.synchronize()
+                        end = timeit.default_timer()
+                        backward_time.append(end - start)
                         
                 # get the statistics of time used: max, min, mean, std
-                mean_val = statistics.mean(time_list)
-                variance_val = statistics.stdev(time_list)
-                max_val = max(time_list)
-                min_val = min(time_list)
-                print(f"最大值: {max_val:.6f} 秒, 最小值: {min_val:.6f} 秒, 平均值: {mean_val:.6f} 秒, 标准差: {variance_val:.6f}")
+                mean_val = statistics.mean(forward_time)
+                variance_val = statistics.stdev(forward_time)
+                max_val = max(forward_time)
+                min_val = min(forward_time)
+                print(f"Forward Pass: 最大值: {max_val:.6f} 秒, 最小值: {min_val:.6f} 秒, 平均值: {mean_val:.6f} 秒, 标准差: {variance_val:.6f}")
+                
+                # get the statistics of time used: max, min, mean, std
+                mean_val = statistics.mean(backward_time)
+                variance_val = statistics.stdev(backward_time)
+                max_val = max(backward_time)
+                min_val = min(backward_time)
+                print(f"Backward Pass: 最大值: {max_val:.6f} 秒, 最小值: {min_val:.6f} 秒, 平均值: {mean_val:.6f} 秒, 标准差: {variance_val:.6f}")
                 
             except torch.cuda.OutOfMemoryError:
                 print(f"⚠️  CUDA OOM: Skipping (seq_len={sequence_length}, d_model={d_model})")
