@@ -252,10 +252,118 @@ class CausalNoHeadSelfAttention(nn.Module):
         # Apply the output projection
         output = self.output_proj(attn_output)
         return output
+    
 
 
+def time_forward(module, inp):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    # 向队列中发送以下三个信号：
+    start.record()
+    _ = module(inp)
+    end.record()
+    
+    # 最终同步
+    torch.cuda.synchronize()
+    
+    # 返回结果 
+    return start.elapsed_time(end) / 1000
 
-if __name__ == '__main__':
+def timed(fn):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    start.record()
+    fn()
+    end.record()
+    torch.cuda.synchronize()
+    
+    return start.elapsed_time(end) / 1000
+
+def time_forward_backward(module, inp):
+    """Time the forward and backward passes separately, returning both in seconds."""
+    # Forward pass
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    result = module(inp)
+    loss = torch.sum(result)
+    end.record()
+    torch.cuda.synchronize()
+
+    time_forward = start.elapsed_time(end) / 1000
+
+    # Backward pass
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    loss.backward()
+    end.record()
+    torch.cuda.synchronize()
+
+    time_backward = start.elapsed_time(end) / 1000
+
+    return time_forward, time_backward
+
+def benchmark_jit_attention():
+    """
+    Compare the performance with/without JIT compilation.
+    Result:
+    
+    Forward Pass:
+        without torch.compile(): 1.91181 ms
+        with    torch.compile(): 0.40038 ms
+        Speedup: 377.49%
+    Backward Pass:
+        without torch.compile(): 2.46272 ms
+        with    torch.compile(): 0.99635 ms
+        Speedup: 147.17%
+    """
+    # Hyperparameters
+    batch_size = 8
+    sequence_length = 1024
+    d_model = 64
+    device = "cuda"
+    
+    # modules and input
+    rope = RotaryEmbedding(context_length=sequence_length, dim=d_model).to(device)
+    attention = CausalNoHeadSelfAttention(d_model=d_model, positional_encoder=rope).to(device)
+    attention_compiled = torch.compile(attention)  # ! compile the attention module
+    x = torch.randn(batch_size, sequence_length, d_model).to(device)
+    
+    # warmup first 
+    for _ in range(5):
+        logit = torch.sum(attention(x))
+        logit.backward()
+        logit = torch.sum(attention_compiled(x))
+        logit.backward()
+    torch.cuda.synchronize()
+    
+    # timing 
+    time_no_compile_forward, time_no_compile_backward  = time_forward_backward(attention, x)
+    time_with_compile_forward, time_with_compile_backward = time_forward_backward(attention_compiled, x)
+    
+    # print result (times in ms)
+    print(f"Forward Pass:")
+    print(f"  without torch.compile(): {time_no_compile_forward * 1000:.5f} ms")
+    print(f"  with    torch.compile(): {time_with_compile_forward * 1000:.5f} ms")
+    print(f"  Speedup: {(time_no_compile_forward - time_with_compile_forward) / time_with_compile_forward * 100:.2f}%")
+
+    print(f"Backward Pass:")
+    print(f"  without torch.compile(): {time_no_compile_backward * 1000:.5f} ms")
+    print(f"  with    torch.compile(): {time_with_compile_backward * 1000:.5f} ms")
+    print(f"  Speedup: {(time_no_compile_backward - time_with_compile_backward) / time_with_compile_backward * 100:.2f}%")
+    
+    
+
+def benchmark_attention():
+    """
+    Key takeaway: the time and memory used is proportional to `sequence_length ^^ 2`
+    """
+    
     # hyperparameters
     batch_size = 8
     sequence_lengths = [256,1024,4096,8192,16384]
@@ -366,3 +474,8 @@ if __name__ == '__main__':
                 # Note: locals() returns a dictionary of all local variables in the current scope
                 # This is to ensure that the varialbes we delete are actually in the scope
                 torch.cuda.empty_cache()
+                
+                
+if __name__ == '__main__':
+    # benchmark_attention()
+    benchmark_jit_attention()
