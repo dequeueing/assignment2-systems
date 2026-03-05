@@ -1,8 +1,10 @@
 import statistics
 import timeit
 
-from cs336_basics.model import RotaryEmbedding, Linear
-from cs336_basics.nn_utils import softmax
+from torch.optim import AdamW
+
+from cs336_basics.model import RotaryEmbedding, Linear, BasicsTransformerLM
+from cs336_basics.nn_utils import cross_entropy, softmax
 
 import einx
 import math
@@ -474,8 +476,131 @@ def benchmark_attention():
                 # Note: locals() returns a dictionary of all local variables in the current scope
                 # This is to ensure that the varialbes we delete are actually in the scope
                 torch.cuda.empty_cache()
-                
+# Forward pass
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+def time_transformer(model, x, targets):
+    # init optimizer
+    optimizer = AdamW(model.parameters())
+    
+    # Forward pass
+    start = torch.cuda.Event(enable_timing=True)
+    forward_end = torch.cuda.Event(enable_timing=True)
+    all_end = torch.cuda.Event(enable_timing=True)
+    
+    
+    start.record()
+    
+    logits = model(x)
+    loss = cross_entropy(logits, targets)
+    
+    forward_end.record()
+    
+    loss.backward()
+    optimizer.step()
+    
+    all_end.record()
+    
+    # sync all
+    torch.cuda.synchronize()
+
+    time_forward = start.elapsed_time(forward_end) / 1000
+    time_all = start.elapsed_time(all_end) / 1000
+    
+    return time_forward, time_all
+
+
+    
+    
+    
+
+def benchmark_transformer():
+    """
+    Benchmarking results:
+    
+        Forward Pass:
+        without torch.compile(): 95.84538 ms
+        with    torch.compile(): 82.26990 ms
+        Speedup: 16.50%
+        
+        Forward + Backward + Optimizer Step:
+        without torch.compile(): 343.58435 ms
+        with    torch.compile(): 300.95616 ms
+        Speedup: 14.16%
+        
+    """
+    # hyperparameters
+    batch_size = 4
+    vocab_size = 10000
+    context_length = 256
+    seq_len = 256
+    device = 'cuda'
+    d_model = 1024
+    d_ff = 4096
+    num_layers = 24
+    num_heads = 16
+
+    # init model and input
+    model = BasicsTransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=10000.0
+    ).to(device)
+    model_compiled = torch.compile(model).to(device)
+    x =  torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    
+    # warmup runs
+    print("Warmup begins")
+    for _ in range(5):
+        logits = model(x)
+        loss = cross_entropy(logits, targets)
+        loss.backward()
+        
+        logits = model_compiled(x)
+        loss = cross_entropy(logits, targets)
+        loss.backward()
+    torch.cuda.synchronize()
+    print("Warmup ends")
+    
+    timelist_no_compile_forward = []
+    timelist_no_compile_all = []
+    timelist_with_compile_forward = []
+    timelist_with_compile_all = []
+    for _ in range(10):
+        time_no_compile_forward, time_no_compile_all  = time_transformer(model, x, targets)
+        time_with_compile_forward, time_with_compile_all = time_transformer(model_compiled, x, targets)
+        
+        # append to list
+        timelist_no_compile_forward.append(time_no_compile_forward)
+        timelist_no_compile_all.append(time_no_compile_all)
+        timelist_with_compile_forward.append(time_with_compile_forward)
+        timelist_with_compile_all.append(time_with_compile_all)
+        
+    # calculate average
+    time_no_compile_forward = sum(timelist_no_compile_forward) / len(timelist_no_compile_forward)
+    time_with_compile_forward = sum(timelist_with_compile_forward) / len(timelist_with_compile_forward)
+    time_no_compile_all = sum(timelist_no_compile_all) / len(timelist_no_compile_all)
+    time_with_compile_all = sum(timelist_with_compile_all) / len(timelist_with_compile_all)
+    
+    print(f"Forward Pass:")
+    print(f"  without torch.compile(): {time_no_compile_forward * 1000:.5f} ms")
+    print(f"  with    torch.compile(): {time_with_compile_forward * 1000:.5f} ms")
+    print(f"  Speedup: {(time_no_compile_forward - time_with_compile_forward) / time_with_compile_forward * 100:.2f}%")
+
+    print(f"Forward + Backward + Optimizer Step:")
+    print(f"  without torch.compile(): {time_no_compile_all * 1000:.5f} ms")
+    print(f"  with    torch.compile(): {time_with_compile_all * 1000:.5f} ms")
+    print(f"  Speedup: {(time_no_compile_all - time_with_compile_all) / time_with_compile_all * 100:.2f}%")
+    
+    
+        
                 
 if __name__ == '__main__':
     # benchmark_attention()
-    benchmark_jit_attention()
+    benchmark_transformer()
