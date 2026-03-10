@@ -69,6 +69,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -134,7 +135,7 @@ def flash_fwd_kernel(
 
     
     # The inner loop
-    for _ in range(T_K):
+    for key_tile_index in range(T_K):
         # load the tile contents
         k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
@@ -152,6 +153,14 @@ def flash_fwd_kernel(
         # compute tile of pre-sofrmax attention scores S
         s = tl.dot(q_i, tl.trans(k_j))
         s *= scale
+        
+        # prepare mask if is_causal is True
+        if is_causal:
+            q_arange = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_arange = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = q_arange[:, None] >= k_arange[None, :]
+            s = tl.where(mask, s, float('-inf'))
+            
         
         # compute m_j
         m_j_minus1 = m
@@ -187,8 +196,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         batch_size = q.shape[0]
         n_queries = q.shape[1]
         n_keys = k.shape[1]
-        D = q.shape[-1]
-        
+        D = q.shape[-1]        
         # define hyperparameters: tile size
         Q_TILE_SIZE = 16
         K_TILE_SIZE = 16
@@ -214,7 +222,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             n_queries, n_keys,
             1 / math.sqrt(D),
             D,
-            Q_TILE_SIZE, K_TILE_SIZE
+            Q_TILE_SIZE, K_TILE_SIZE, is_causal
         )
         
         # save in context 
@@ -223,6 +231,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         ctx.K_TILE_SIZE = K_TILE_SIZE
         ctx.q_shape = q.shape
         ctx.k_shape = k.shape
+        ctx.is_causal = is_causal
         
         # return result
         return o
