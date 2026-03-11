@@ -302,5 +302,54 @@ class FlashAttentionTriton(torch.autograd.Function):
         return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
     
     
+def benchmark_attention():
+    batch_size = 1
+    is_causal = True
+    device = "cuda"
+    
+    seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    d_models = [16, 32, 64, 128]
+    dtypes = [torch.float32, torch.bfloat16]
+    impls = [FlashAttentionTriton, FlashAttentionPytorch]
+    
+    for seq_len in seq_lens:
+        for d_model in d_models:
+            for dtype in dtypes:
+                for impl in impls:
+                    try:
+                        q = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                        k = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                        v = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+
+                        def run_forward(_impl=impl, _q=q, _k=k, _v=v):
+                            return _impl.apply(_q, _k, _v, is_causal)
+
+                        out = impl.apply(q, k, v, is_causal)
+                        dout = torch.randn_like(out)
+
+                        def run_backward(_out=out, _dout=dout):
+                            _out.backward(_dout, retain_graph=True)
+
+                        def run_e2e(_impl=impl, _q=q, _k=k, _v=v, _dout=dout):
+                            _out = _impl.apply(_q, _k, _v, is_causal)
+                            _out.backward(_dout)
+
+                        ms_fwd = triton.testing.do_bench(run_forward, warmup=25, rep=100)
+                        ms_bwd = triton.testing.do_bench(run_backward, warmup=25, rep=100)
+                        ms_e2e = triton.testing.do_bench(run_e2e, warmup=25, rep=100)
+
+                        print(f"Implementation: {impl.__name__}")
+                        print(f"Sequence Length: {seq_len}, d_model: {d_model}, dtype: {dtype}")
+                        print(f"Forward: {ms_fwd:.3f} ms")
+                        print(f"Backward: {ms_bwd:.3f} ms")
+                        print(f"End-to-End: {ms_e2e:.3f} ms")
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"OOM skipped: impl={impl.__name__}, seq_len={seq_len}, d_model={d_model}, dtype={dtype}")
+                    finally:
+                        torch.cuda.empty_cache()
+                    
+    
+    
+
 if __name__ == '__main__':
-    pass
+    benchmark_attention()
