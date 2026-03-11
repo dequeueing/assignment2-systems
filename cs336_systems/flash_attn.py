@@ -10,66 +10,44 @@ import numpy as np
 
 from einops import rearrange 
 
-class BackwardLayer(nn.Module):
-    # 注意：加上 is_causal 参数
-    def __init__(self, grad_out, l, q, k, v, o, is_causal=False):
-        super().__init__()
-        self.grad_out = grad_out
-        self.l = l
-        self.q = q
-        self.k = k
-        self.v = v
-        self.o = o
-        self.is_causal = is_causal # 保存 causal flag
-        
-    def forward(self):
-        # get the shapes 
-        batch_size = self.q.shape[0]
-        n_q = self.q.shape[1]
-        n_k = self.k.shape[1]
-        d_model = self.q.shape[-1]
-        
-        q = self.q   # n_q, d
-        k = self.k   # n_k, d
-        l = self.l   # n_q
-        v = self.v   # n_k, d
-        o = self.o   # n_q, d
-        dO = self.grad_out  # n_q, d
+def flash_backward_fn(grad_out, l, q, k, v, o, is_causal):
+    # get the shapes 
+    n_q = q.shape[1]
+    n_k = k.shape[1]
+    d_model = q.shape[-1]
     
-        # compute D
-        D = torch.sum(o * dO, dim=-1)   # (batch_size, n_q)
-        
-        # get s
-        s = torch.einsum("... q d, ... k d -> ... q k", q, k)
-        s /= math.sqrt(d_model)   # (batch_size, n_q, n_k)
-        
-        # 👑 加上 Causal Mask！
-        if self.is_causal:
-            # 构造掩码矩阵
-            q_idx = torch.arange(n_q, device=q.device).unsqueeze(1)
-            k_idx = torch.arange(n_k, device=k.device).unsqueeze(0)
-            mask = q_idx >= k_idx
-            # 填入负无穷，这样 exp(-inf) 就会变成 0
-            s = s.masked_fill(~mask, float('-inf'))
-        
-        # get pij (✅ 修复 broadcasting)
-        p = torch.exp(s - l.unsqueeze(-1))  
-        
-        # get dV
-        dV = torch.einsum('... q k, ... q d -> ... k d', p, dO)   
-        
-        # get dP
-        dP = torch.einsum('... q d, ... k d -> ... q k', dO, v)   
-        
-        # get dS (✅ 修复 broadcasting)
-        dS = p * (dP - D.unsqueeze(-1))        
-        
-        # get dQ and DK
-        dQ = torch.einsum('... q k, ... k d -> ... q d', dS, k) / math.sqrt(d_model)
-        dK = torch.einsum('... q k, ... q d -> ... k d', dS, q) / math.sqrt(d_model)
-        
-        return dQ, dK, dV    
-        
+    # compute D
+    D = torch.sum(o * grad_out, dim=-1)   # (batch_size, n_q)
+    
+    # get s
+    s = torch.einsum("... q d, ... k d -> ... q k", q, k)
+    s /= math.sqrt(d_model)   # (batch_size, n_q, n_k)
+    
+    # 👑 Causal Mask
+    if is_causal:
+        q_idx = torch.arange(n_q, device=q.device).unsqueeze(1)
+        k_idx = torch.arange(n_k, device=k.device).unsqueeze(0)
+        mask = q_idx >= k_idx
+        s = s.masked_fill(~mask, float('-inf'))
+    
+    # get pij 
+    p = torch.exp(s - l.unsqueeze(-1))  
+    
+    # get dV, dP
+    dV = torch.einsum('... q k, ... q d -> ... k d', p, grad_out)   
+    dP = torch.einsum('... q d, ... k d -> ... q k', grad_out, v)   
+    
+    # get dS 
+    dS = p * (dP - D.unsqueeze(-1))        
+    
+    # get dQ and DK
+    dQ = torch.einsum('... q k, ... k d -> ... q d', dS, k) / math.sqrt(d_model)
+    dK = torch.einsum('... q k, ... q d -> ... k d', dS, q) / math.sqrt(d_model)
+    
+    return dQ, dK, dV
+
+# 🔥 核心：在这里全局编译一次，整个训练过程复用！
+compiled_flash_backward = torch.compile(flash_backward_fn)        
         
     
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -94,6 +72,13 @@ class FlashAttentionPytorch(torch.autograd.Function):
         s = torch.einsum("... q d, ...k d -> ... q k", q, k)
         s /= math.sqrt(D)
         
+        # 1.5 Masking 
+        if is_causal:
+            q_arange = torch.arange(0, n_queries, device='cuda')  # (q, )
+            k_arange = torch.arange(0, n_keys, device = 'cuda')     # (k, )
+            mask = q_arange[..., None] >= k_arange[None, ...]
+            s = torch.where(mask, s, float('-inf'))
+        
         # 2. softmax for each row 
         p = torch.softmax(s, dim=-1)  # (batch_size, n_queries, n_keys)
         
@@ -101,9 +86,12 @@ class FlashAttentionPytorch(torch.autograd.Function):
         o = torch.einsum("... q k, ... k d -> ... q d", p, v) # (batch_size, n_queries, D)
         
         # 4. Li
-        s = torch.exp(s) 
-        s = torch.sum(s, dim=-1)
-        l = torch.log(s)   # (batch_size, n_queries, )
+        # s = torch.exp(s) 
+        # s = torch.sum(s, dim=-1)
+        # l = torch.log(s)   # (batch_size, n_queries, )
+        # FIXME: use logsumexp, a safer low-level function
+        l = torch.logsumexp(s, dim=-1)
+        
         
         # save input in context
         ctx.save_for_backward(l, q, k, v, o)
@@ -117,10 +105,8 @@ class FlashAttentionPytorch(torch.autograd.Function):
         l, q, k, v, o = ctx.saved_tensors
         is_causal = ctx.is_causal
     
-        
-        backward_layer = BackwardLayer(grad_out, l, q, k, v, o, is_causal)
-        layer_compiled = torch.compile(backward_layer)
-        dQ, dK, dV = layer_compiled()
+        layer_compiled = compiled_flash_backward
+        dQ, dK, dV = layer_compiled(grad_out, l, q, k, v, o, is_causal)
         return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
 
     
@@ -311,10 +297,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         l, q, k, v, o = ctx.saved_tensors
         is_causal = ctx.is_causal
     
-        
-        backward_layer = BackwardLayer(grad_out, l, q, k, v, o, is_causal)
-        layer_compiled = torch.compile(backward_layer)
-        dQ, dK, dV = layer_compiled()
+        layer_compiled = compiled_flash_backward
+        dQ, dK, dV = layer_compiled(grad_out, l, q, k, v, o, is_causal)
         return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
     
     
