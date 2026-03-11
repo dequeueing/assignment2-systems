@@ -9,6 +9,68 @@ import torch.nn as nn
 import numpy as np
 
 from einops import rearrange 
+
+class BackwardLayer(nn.Module):
+    # 注意：加上 is_causal 参数
+    def __init__(self, grad_out, l, q, k, v, o, is_causal=False):
+        super().__init__()
+        self.grad_out = grad_out
+        self.l = l
+        self.q = q
+        self.k = k
+        self.v = v
+        self.o = o
+        self.is_causal = is_causal # 保存 causal flag
+        
+    def forward(self):
+        # get the shapes 
+        batch_size = self.q.shape[0]
+        n_q = self.q.shape[1]
+        n_k = self.k.shape[1]
+        d_model = self.q.shape[-1]
+        
+        q = self.q   # n_q, d
+        k = self.k   # n_k, d
+        l = self.l   # n_q
+        v = self.v   # n_k, d
+        o = self.o   # n_q, d
+        dO = self.grad_out  # n_q, d
+    
+        # compute D
+        D = torch.sum(o * dO, dim=-1)   # (batch_size, n_q)
+        
+        # get s
+        s = torch.einsum("... q d, ... k d -> ... q k", q, k)
+        s /= math.sqrt(d_model)   # (batch_size, n_q, n_k)
+        
+        # 👑 加上 Causal Mask！
+        if self.is_causal:
+            # 构造掩码矩阵
+            q_idx = torch.arange(n_q, device=q.device).unsqueeze(1)
+            k_idx = torch.arange(n_k, device=k.device).unsqueeze(0)
+            mask = q_idx >= k_idx
+            # 填入负无穷，这样 exp(-inf) 就会变成 0
+            s = s.masked_fill(~mask, float('-inf'))
+        
+        # get pij (✅ 修复 broadcasting)
+        p = torch.exp(s - l.unsqueeze(-1))  
+        
+        # get dV
+        dV = torch.einsum('... q k, ... q d -> ... k d', p, dO)   
+        
+        # get dP
+        dP = torch.einsum('... q d, ... k d -> ... q k', dO, v)   
+        
+        # get dS (✅ 修复 broadcasting)
+        dS = p * (dP - D.unsqueeze(-1))        
+        
+        # get dQ and DK
+        dQ = torch.einsum('... q k, ... k d -> ... q d', dS, k) / math.sqrt(d_model)
+        dK = torch.einsum('... q k, ... q d -> ... k d', dS, q) / math.sqrt(d_model)
+        
+        return dQ, dK, dV    
+        
+        
     
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
@@ -45,15 +107,22 @@ class FlashAttentionPytorch(torch.autograd.Function):
         
         # save input in context
         ctx.save_for_backward(l, q, k, v, o)
+        ctx.is_causal = is_causal
         
         return o
     
-    
-
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
+        # load tensors from context 
+        l, q, k, v, o = ctx.saved_tensors
+        is_causal = ctx.is_causal
     
+        
+        backward_layer = BackwardLayer(grad_out, l, q, k, v, o, is_causal)
+        layer_compiled = torch.compile(backward_layer)
+        dQ, dK, dV = layer_compiled()
+        return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
+
     
 @triton.jit
 def flash_fwd_kernel(
@@ -238,8 +307,15 @@ class FlashAttentionTriton(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError
-
+        # load tensors from context 
+        l, q, k, v, o = ctx.saved_tensors
+        is_causal = ctx.is_causal
+    
+        
+        backward_layer = BackwardLayer(grad_out, l, q, k, v, o, is_causal)
+        layer_compiled = torch.compile(backward_layer)
+        dQ, dK, dV = layer_compiled()
+        return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
     
     
 if __name__ == '__main__':
