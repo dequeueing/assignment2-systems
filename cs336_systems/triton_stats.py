@@ -159,11 +159,20 @@ def welford_algorithm(
     # store to memory
     tl.store(mean_block_ptr, mean, boundary_check=(0))
     tl.store(var_block_ptr, var, boundary_check=(0))
+    
+    
+def naive_torch(x: torch.Tensor):
+    # shape: (rows, D)
+    mean = torch.mean(x, dim=-1)
+    var = torch.var(x, dim=-1, unbiased=False)
+    return mean, var
+    
+naive_torch_compiled = torch.compile(naive_torch)
 
 
     
 if __name__ == '__main__':
-    ROWS, D = 64, 128
+    ROWS, D = 4096, 4096  
     
     # init tensors
     x      = torch.randn(ROWS, D, device="cuda")
@@ -171,11 +180,11 @@ if __name__ == '__main__':
     var    = torch.empty(ROWS,    device="cuda")
     
     # compute tile sizes 
-    ROWS_TILE_SIZE = 16
-    D_TILE_SIZE    = triton.next_power_of_2(D) // 16  # = 8
+    ROWS_TILE_SIZE = 32
+    D_TILE_SIZE    = 1024  # = 8
 
     def cdiv(a, b): return (a + b - 1) // b
-    grid = (cdiv(ROWS, ROWS_TILE_SIZE),)  # = (4,)
+    grid = (cdiv(ROWS, ROWS_TILE_SIZE),)  
 
     # compute_mean_and_variance[grid](
     #     x,        
@@ -187,6 +196,8 @@ if __name__ == '__main__':
     #     ROWS_TILE_SIZE=ROWS_TILE_SIZE,
     #     D_TILE_SIZE=D_TILE_SIZE,
     # )
+    
+    # benchmark Triton kernel
     welford_algorithm[grid](
         x,        
         mean, var,
@@ -198,19 +209,54 @@ if __name__ == '__main__':
         D_TILE_SIZE=D_TILE_SIZE,
     )
     
+    # benchmark Pytorch kernel
+    mean_real, var_real = naive_torch(x)   
+     
     
-    print(mean)
-    print(var)
-    
-    mean_real = torch.mean(x, dim=-1)
-    var_real = torch.var(x, dim=-1, unbiased=False)
-    
-    
-    print(mean_real)
-    print(var_real)
-    
-    
-    # check 
+    # check: correctness proved
     print(torch.allclose(mean_real, mean))
     print(torch.allclose(var_real, var))
+    
+    mean = torch.empty((ROWS,), device=x.device, dtype=torch.float32)
+    var = torch.empty((ROWS,), device=x.device, dtype=torch.float32)
+    
+    def run_welford(_x=x, ROWS_TILE_SIZE=32, D_TILE_SIZE=1024):
+        ROWS, D = _x.shape
+                
+        # 2. 定义 Grid：按行分块
+        # 因为你的 kernel 逻辑里 row_tile_idx = tl.program_id(0)
+        grid = (triton.cdiv(ROWS, ROWS_TILE_SIZE),)
+        
+        # 3. 启动 Kernel
+        welford_algorithm[grid](
+            x_ptr=_x,
+            mean_ptr=mean,
+            var_ptr=var,
+            x_stride_row=_x.stride(0),
+            x_stride_dim=_x.stride(1),
+            mean_stride=mean.stride(0),
+            var_stride=var.stride(0),
+            ROWS=ROWS,
+            D=D,
+            ROWS_TILE_SIZE=ROWS_TILE_SIZE,
+            D_TILE_SIZE=D_TILE_SIZE,
+        )
+        return mean, var
+    
+    # benchmark triton implementation 
+    ms_triton = triton.testing.do_bench(run_welford)
+    gbps = (x.nelement() * x.element_size()) / (ms_triton * 1e-3) / 1e9
+    print(f"Time: {ms_triton:.4f} ms")
+    print(f"Bandwidth: {gbps:.2f} GB/s")
+    
+    def run_triton(_x=x):
+        return naive_torch_compiled(_x)
+    
+    ms_torch = triton.testing.do_bench(run_triton)
+    gbps = (x.nelement() * x.element_size()) / (ms_torch * 1e-3) / 1e9
+    print(f"Time: {ms_torch:.4f} ms")
+    print(f"Bandwidth: {gbps:.2f} GB/s")
+    
+    
+    # benchmark pytorch implementation
     
