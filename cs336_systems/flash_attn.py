@@ -1,3 +1,4 @@
+import argparse
 import math
 
 import triton
@@ -47,9 +48,9 @@ def flash_backward_fn(grad_out, l, q, k, v, o, is_causal):
     return dQ, dK, dV
 
 # 🔥 核心：在这里全局编译一次，整个训练过程复用！
-compiled_flash_backward = torch.compile(flash_backward_fn)        
-        
-    
+compiled_flash_backward = torch.compile(flash_backward_fn)
+
+
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, is_causal=False):
@@ -110,6 +111,17 @@ class FlashAttentionPytorch(torch.autograd.Function):
         return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
 
     
+@triton.autotune(
+    configs=[
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+        triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 128}, num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64},  num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64},  num_warps=4),
+        triton.Config({'Q_TILE_SIZE': 32,  'K_TILE_SIZE': 32},  num_warps=2),
+        triton.Config({'Q_TILE_SIZE': 16,  'K_TILE_SIZE': 16},  num_warps=1),
+    ],
+    key=['N_QUERIES', 'N_KEYS', 'D'],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -251,24 +263,20 @@ class FlashAttentionTriton(torch.autograd.Function):
         batch_size = q.shape[0]
         n_queries = q.shape[1]
         n_keys = k.shape[1]
-        D = q.shape[-1]        
-        # define hyperparameters: tile size
-        Q_TILE_SIZE = 16
-        K_TILE_SIZE = 16
-        
-        # validation check 
+        D = q.shape[-1]
+
+        # validation check
         assert q.is_cuda and k.is_cuda and v.is_cuda, "Expected CUDA tensors"
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), "Our pointer arithmetic will assume contiguous x"
-        
-        
+
         # prepare output buffers
-        l = torch.empty((batch_size, n_queries, ),  device=q.device)
+        l = torch.empty((batch_size, n_queries,),  device=q.device)
         o = torch.empty((batch_size, n_queries, D), device=q.device)
-        
-        
-        grid = ((n_queries + Q_TILE_SIZE - 1) // Q_TILE_SIZE, batch_size)
+
+        # grid uses meta dict so autotune-chosen Q_TILE_SIZE is accessible
+        grid = lambda meta: (triton.cdiv(n_queries, meta['Q_TILE_SIZE']), batch_size)
         flash_fwd_kernel[grid](
-            q, k, v, o, l, 
+            q, k, v, o, l,
             q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
@@ -277,15 +285,11 @@ class FlashAttentionTriton(torch.autograd.Function):
             n_queries, n_keys,
             1 / math.sqrt(D),
             D,
-            Q_TILE_SIZE, K_TILE_SIZE, is_causal
+            is_causal=is_causal,
         )
-        
-        # save in context 
+
+        # save in context
         ctx.save_for_backward(l, q, k, v, o)
-        ctx.Q_TILE_SIZE = Q_TILE_SIZE
-        ctx.K_TILE_SIZE = K_TILE_SIZE
-        ctx.q_shape = q.shape
-        ctx.k_shape = k.shape
         ctx.is_causal = is_causal
         
         # return result
@@ -302,54 +306,74 @@ class FlashAttentionTriton(torch.autograd.Function):
         return dQ, dK, dV, None  # FIXME: the backward should return the same number of args
     
     
-def benchmark_attention():
+def benchmark_attention(fwd_only: bool = False):
     batch_size = 1
     is_causal = True
     device = "cuda"
-    
-    seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-    d_models = [16, 32, 64, 128]
+
+    # fwd_only mode enables longer sequences (no N² backward allocation)
+    if fwd_only:
+        seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+        d_models = [64, 128]
+    else:
+        seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+        d_models = [16, 32, 64, 128]
+
     dtypes = [torch.float32, torch.bfloat16]
     impls = [FlashAttentionTriton, FlashAttentionPytorch]
-    
+
     for seq_len in seq_lens:
         for d_model in d_models:
             for dtype in dtypes:
                 for impl in impls:
+                    tag = f"[{impl.__name__}] seq_len={seq_len:>7}, d_model={d_model:>3}, dtype={str(dtype).split('.')[-1]:>10}"
                     try:
-                        q = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
-                        k = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
-                        v = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                        if fwd_only:
+                            q = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
+                            k = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
+                            v = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
 
-                        def run_forward(_impl=impl, _q=q, _k=k, _v=v):
-                            return _impl.apply(_q, _k, _v, is_causal)
+                            def run_forward(_impl=impl, _q=q, _k=k, _v=v):
+                                with torch.no_grad():
+                                    return _impl.apply(_q, _k, _v, is_causal)
 
-                        out = impl.apply(q, k, v, is_causal)
-                        dout = torch.randn_like(out)
+                            ms_fwd = triton.testing.do_bench(run_forward, warmup=25, rep=100)
+                            print(f"{tag}  |  fwd={ms_fwd:.3f} ms")
+                        else:
+                            q = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                            k = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                            v = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
 
-                        def run_backward(_out=out, _dout=dout):
-                            _out.backward(_dout, retain_graph=True)
+                            out = impl.apply(q, k, v, is_causal)
+                            dout = torch.randn_like(out)
 
-                        def run_e2e(_impl=impl, _q=q, _k=k, _v=v, _dout=dout):
-                            _out = _impl.apply(_q, _k, _v, is_causal)
-                            _out.backward(_dout)
+                            def run_forward(_impl=impl, _q=q, _k=k, _v=v):
+                                return _impl.apply(_q, _k, _v, is_causal)
 
-                        ms_fwd = triton.testing.do_bench(run_forward, warmup=25, rep=100)
-                        ms_bwd = triton.testing.do_bench(run_backward, warmup=25, rep=100)
-                        ms_e2e = triton.testing.do_bench(run_e2e, warmup=25, rep=100)
+                            def run_backward(_out=out, _dout=dout):
+                                _out.backward(_dout, retain_graph=True)
 
-                        print(f"Implementation: {impl.__name__}")
-                        print(f"Sequence Length: {seq_len}, d_model: {d_model}, dtype: {dtype}")
-                        print(f"Forward: {ms_fwd:.3f} ms")
-                        print(f"Backward: {ms_bwd:.3f} ms")
-                        print(f"End-to-End: {ms_e2e:.3f} ms")
+                            def run_e2e(_impl=impl, _q=q, _k=k, _v=v, _dout=dout):
+                                _out = _impl.apply(_q, _k, _v, is_causal)
+                                _out.backward(_dout)
+
+                            ms_fwd = triton.testing.do_bench(run_forward, warmup=25, rep=100)
+                            ms_bwd = triton.testing.do_bench(run_backward, warmup=25, rep=100)
+                            ms_e2e = triton.testing.do_bench(run_e2e, warmup=25, rep=100)
+                            print(f"{tag}  |  fwd={ms_fwd:.3f} ms  bwd={ms_bwd:.3f} ms  e2e={ms_e2e:.3f} ms")
+
                     except torch.cuda.OutOfMemoryError:
-                        print(f"OOM skipped: impl={impl.__name__}, seq_len={seq_len}, d_model={d_model}, dtype={dtype}")
+                        print(f"{tag}  |  OOM")
                     finally:
                         torch.cuda.empty_cache()
-                    
-    
-    
+
 
 if __name__ == '__main__':
-    benchmark_attention()
+    parser = argparse.ArgumentParser(description="Flash Attention benchmark")
+    parser.add_argument(
+        "--fwd-only",
+        action="store_true",
+        help="Benchmark forward pass only (no backward). Enables longer sequence lengths.",
+    )
+    args = parser.parse_args()
+    benchmark_attention(fwd_only=args.fwd_only)
