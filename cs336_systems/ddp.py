@@ -1,5 +1,6 @@
 import os
 import random
+import timeit
 
 import numpy as np
 
@@ -8,6 +9,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from cs336_basics.optimizer import AdamW
+from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.model import BasicsTransformerLM
 
 
     
@@ -230,9 +235,193 @@ def run_comparison(path="initial_weights.pt"):
     
     for item in weight1:
         print(torch.allclose(weight1[item], weight2[item]))
+        
+        
+def train_ml_single_node():
+    # hyperparameters
+    d_model = 768
+    d_ff = 3072
+    num_layers = 12
+    num_heads = 12
+    vocab_size = 4096
+    context_length = 4096
+    batch_size = 2
+    sequence_length = 2048
     
+    # init model
+    
+    model = BasicsTransformerLM(
+        vocab_size, 
+        context_length,
+        d_model,
+        num_layers,
+        num_heads,
+        d_ff,
+        rope_theta=10000.0
+    )
+    model = model.to('cuda')
+    
+    # prepare inputs 
+    x = torch.randint(low=0, high=vocab_size, size=(batch_size, sequence_length,), device='cuda')
+    targets = torch.randint(low=0, high=vocab_size, size=(batch_size, sequence_length,), device='cuda')
+    
+    # prepare optimizer 
+    optimizer = AdamW(model.parameters())
+    
+    # warm up
+    for _ in range(5):
+        y = model(x)
+        loss = cross_entropy(y, targets)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize()
+
+        
+    # forward
+    total_time = 0
+    for _ in range(10):
+        optimizer.zero_grad()
+        start_time = timeit.default_timer()
+        y = model(x)
+        loss = cross_entropy(y, targets)
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        end_time = timeit.default_timer()
+        
+        
+        # acculmulate time 
+        total_time += end_time - start_time
+        # print(f"The time used: {end_time - start_time} second")
+        
+    print(f"Average training time: {total_time / 10}")
+
+def init_model():
+    # hyperparameters
+    d_model = 768
+    d_ff = 3072
+    num_layers = 12
+    num_heads = 12
+    vocab_size = 4096
+    context_length = 4096
+    
+        
+    # init model
+    model = BasicsTransformerLM(
+        vocab_size, 
+        context_length,
+        d_model,
+        num_layers,
+        num_heads,
+        d_ff,
+        rope_theta=10000.0
+    )
+    model = model.to('cuda')
+    return model
+    
+
+def worker_function_train_ml(rank, world_size, mig_uuids, x_global, target_global):
+    worker_set(rank, world_size, mig_uuids)
+    
+    model = init_model()
+    model.load_state_dict(torch.load("ml_weights.pt"))
+    model.to('cuda')
+    
+    batch_size_global = x_global.shape[0]
+    batch_size_local = batch_size_global // world_size # FIXME: / will produce a float, use // to get an integer
+    x_local = x_global[rank * batch_size_local: (rank + 1) * batch_size_local ,:].to('cuda')
+    target_global = target_global[rank * batch_size_local: (rank + 1) * batch_size_local ,:].to('cuda')
+    
+    optimizer = optim.AdamW(model.parameters())
+    
+    # warmup runs 
+    for _ in range(5):
+        y = model(x_local)
+        loss = cross_entropy(y, target_global)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize()
+    
+    
+    # forward, backward and step
+    forward_time, backward_time, reduce_time, step_time = 0,0,0,0
+    for _ in range(10):
+        time_series = []
+        
+        # start timer 
+        time_series.append(timeit.default_timer())
+        
+        optimizer.zero_grad()
+        y = model(x_local)
+        time_series.append(timeit.default_timer())
+        
+        loss = cross_entropy(y, target_global)
+        loss.backward()
+        time_series.append(timeit.default_timer())
+    
+        # now gradient is ready, all-reduce! 
+        for param in model.parameters(): 
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad.data /= world_size
+        time_series.append(timeit.default_timer())
+                
+        # now all workers should have the same copy of gradient 
+        optimizer.step()
+        time_series.append(timeit.default_timer())
+        
+        forward_time += time_series[1] - time_series[0]
+        backward_time += time_series[2] - time_series[1]
+        reduce_time += time_series[3] - time_series[2]
+        step_time += time_series[4] - time_series[3]
+        
+    # check results
+    if rank == 0:
+        print(f"average forward_time: {forward_time / 10} second")
+        print(f"average backward_time: {backward_time / 10} second")
+        print(f"average reduce_time: {reduce_time / 10} second")
+        print(f"average step_time: {step_time / 10} second")
+        
+        # result:
+        # average forward_time: 0.03033671269949991 second
+        # average backward_time: 0.21405878749210389 second
+        # average reduce_time: 1.1275449506065343 second
+        # average step_time: 0.002479371696244925 second
+        
+        # 阶段,平均耗时 (秒),占比 (约)
+        # Forward Pass,0.0303,2.2%
+        # Backward Pass,0.2141,15.6%
+        # Reduce (Communication),1.1275,82.2%
+        # Optimizer Step,0.0025,0.2%
+    
+    
+def train_ml_parallel():
+    my_migs = [
+        "MIG-a7faedc1-5bdf-5b74-9e67-b5be56d37539",
+        "MIG-5ec85cc6-b518-561c-b061-539bae6c110f"
+    ]
+    world_size = len(my_migs)
+    
+    # init and save a consistent model weight 
+    model = init_model()
+    torch.save(model.state_dict(), "ml_weights.pt")
+    del model
+    
+    batch_size = 2
+    sequence_length = 2048
+    x = torch.randint(low=0, high=4096, size=(batch_size, sequence_length,))
+    targets = torch.randint(low=0, high=4096, size=(batch_size, sequence_length,))
+    
+    mp.spawn(
+        worker_function_train_ml,
+        args=(world_size, my_migs, x, targets),
+        nprocs=world_size,
+        join=True
+    )
+ 
     
     
     
 if __name__ == "__main__":
-    run_comparison()
+    # run_comparison()
+    train_ml_parallel()
